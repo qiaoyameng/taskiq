@@ -13,9 +13,11 @@ from taskiq.acks import AckableMessage, AcknowledgeType
 from taskiq.brokers.inmemory_broker import InMemoryBroker
 from taskiq.brokers.shared_broker import async_shared_broker
 from taskiq.brokers.zmq_broker import ZeroMQBroker
+from taskiq.capabilities import CapabilityMismatchPolicy
 from taskiq.context import Context
 from taskiq.events import TaskiqEvents
 from taskiq.exceptions import (
+    CapabilityMismatchError,
     NoResultError,
     ResultGetError,
     ResultIsReadyError,
@@ -47,6 +49,8 @@ __all__ = [
     "AsyncTaskiqDecoratedTask",
     "AsyncTaskiqTask",
     "BrokerMessage",
+    "CapabilityMismatchError",
+    "CapabilityMismatchPolicy",
     "Context",
     "InMemoryBroker",
     "NoResultError",

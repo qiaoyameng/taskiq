@@ -3,7 +3,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from functools import wraps
 from logging import getLogger
 from typing import (
@@ -21,6 +21,7 @@ from uuid import uuid4
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.abc.serializer import TaskiqSerializer
 from taskiq.acks import AckableMessage
+from taskiq.capabilities import CapabilityMismatchPolicy
 from taskiq.decor import AsyncTaskiqDecoratedTask
 from taskiq.events import TaskiqEvents
 from taskiq.exceptions import TaskBrokerMismatchError
@@ -118,6 +119,13 @@ class AsyncBroker(ABC):
         self.is_worker_process = False
         # True only if broker runs in scheduler process.
         self.is_scheduler_process = False
+        # Capabilities this worker provides. Receivers match task-level
+        # capability requirements against this mapping before executing.
+        self.worker_capabilities: dict[str, str] = {}
+        # What the receiver does with a task this worker cannot execute.
+        self.capability_mismatch_policy = CapabilityMismatchPolicy.REJECT
+        # Maximum number of immediate re-routes before rejecting a task.
+        self.max_capability_requeues = 3
 
     def find_task(self, task_name: str) -> AsyncTaskiqDecoratedTask[Any, Any] | None:
         """
@@ -511,6 +519,54 @@ class AsyncBroker(ABC):
         :return: self
         """
         self.formatter = formatter
+        return self
+
+    def with_capabilities(
+        self,
+        capabilities: "Mapping[str, Any] | None" = None,
+        **kwargs: Any,
+    ) -> "Self":
+        """
+        Declare capabilities this worker provides.
+
+        Receivers match task-level capability requirements against
+        this mapping before injecting parameters and executing tasks.
+
+        :param capabilities: mapping of capability names to versions.
+        :param kwargs: additional capabilities as keyword arguments.
+        :return: self
+        """
+        new_capabilities: dict[str, Any] = {}
+        if capabilities:
+            new_capabilities.update(capabilities)
+        new_capabilities.update(kwargs)
+        self.worker_capabilities = {
+            str(name): str(version) for name, version in new_capabilities.items()
+        }
+        return self
+
+    def with_capability_mismatch_policy(
+        self,
+        policy: "CapabilityMismatchPolicy | str",
+        max_requeues: "int | None" = None,
+    ) -> "Self":
+        """
+        Choose what the worker does with tasks it cannot execute.
+
+        REJECT stores a structured failed result and acknowledges the
+        message. REROUTE re-publishes the message at most
+        `max_requeues` times and then rejects it, so mismatched tasks
+        are never requeued immediately and infinitely.
+
+        :param policy: mismatch handling policy.
+        :param max_requeues: maximum number of re-route attempts.
+        :return: self
+        """
+        self.capability_mismatch_policy = CapabilityMismatchPolicy(policy)
+        if max_requeues is not None:
+            if max_requeues < 0:
+                raise ValueError("max_requeues cannot be negative.")
+            self.max_capability_requeues = max_requeues
         return self
 
     def _register_task(

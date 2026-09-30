@@ -16,6 +16,7 @@ from typing import (
 from pydantic import BaseModel
 
 from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.capabilities import CAPABILITIES_LABEL
 from taskiq.exceptions import SendTaskError
 from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
@@ -329,6 +330,12 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
             # never from the wire. It holds exception classes, which
             # can't be faithfully serialized, so don't ship it at all.
             if label == "types_of_exceptions":
+                continue
+            # `capabilities` holds a structured mapping of required
+            # capabilities to minimum versions. Receivers read it back
+            # from the wire, so keep it as-is instead of stringifying.
+            if label == CAPABILITIES_LABEL:
+                labels[label] = label_val
                 continue
             labels[label], labels_types[label] = prepare_label(label_val)
 

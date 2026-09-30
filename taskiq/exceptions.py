@@ -96,6 +96,13 @@ class TaskRejectedError(TaskiqError):
     __template__ = "Task was rejected"
 
 
+class CapabilityMismatchError(TaskRejectedError):
+    """Worker cannot execute a task due to missing capabilities."""
+
+    __template__ = "Task cannot be executed on this worker: {mismatches}"
+    mismatches: Any = None
+
+
 class ScheduledTaskCancelledError(TaskiqError):
     """Scheduled task was cancelled and not sent to the queue."""
 

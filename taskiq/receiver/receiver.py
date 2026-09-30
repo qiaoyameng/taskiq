@@ -19,8 +19,17 @@ from taskiq_dependencies import DependencyGraph
 from taskiq.abc.broker import AckableMessage, AsyncBroker
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
+from taskiq.capabilities import (
+    CAPABILITIES_LABEL,
+    CAPABILITY_MISMATCHES_LABEL,
+    CAPABILITY_REQUEUES_LABEL,
+    CapabilityCheck,
+    CapabilityMismatchPolicy,
+    check_capabilities,
+    normalize_requirements,
+)
 from taskiq.context import Context
-from taskiq.exceptions import NoResultError
+from taskiq.exceptions import CapabilityMismatchError, NoResultError
 from taskiq.message import TaskiqMessage
 from taskiq.receiver.params_parser import parse_params
 from taskiq.result import TaskiqResult
@@ -182,6 +191,15 @@ class Receiver:
             if ack_controller.is_ackable:
                 await ack_controller.ack()
             return
+        capability_check = self._check_capabilities(task.labels, taskiq_msg.labels)
+        if capability_check is not None and not capability_check.satisfied:
+            await self._handle_capability_mismatch(
+                taskiq_msg,
+                capability_check,
+                ack_controller,
+                raise_err=raise_err,
+            )
+            return
         logger.debug(
             "Function for task %s is resolved. Executing...",
             taskiq_msg.task_name,
@@ -248,6 +266,110 @@ class Receiver:
             raise ValueError(
                 f"Invalid ack_type label {ack_type!r} for task {message.task_name}.",
             ) from exc
+
+    def _check_capabilities(
+        self,
+        task_labels: dict[str, Any],
+        message_labels: dict[str, Any],
+    ) -> CapabilityCheck | None:
+        """
+        Match declared capability requirements against worker capabilities.
+
+        Requirements declared on the task and on the message are merged,
+        with message-level requirements taking precedence. Tasks without
+        any capability requirements are not checked at all.
+
+        :param task_labels: labels of the registered task.
+        :param message_labels: labels of the received message.
+        :return: check result, or None when nothing is required.
+        """
+        requirements = normalize_requirements(
+            task_labels.get(CAPABILITIES_LABEL),
+        )
+        requirements.update(
+            normalize_requirements(message_labels.get(CAPABILITIES_LABEL)),
+        )
+        if not requirements:
+            return None
+        return check_capabilities(requirements, self.broker.worker_capabilities)
+
+    async def _handle_capability_mismatch(
+        self,
+        message: TaskiqMessage,
+        check: CapabilityCheck,
+        ack_controller: AckController,
+        raise_err: bool = False,
+    ) -> None:
+        """
+        Handle a task this worker cannot execute.
+
+        Depending on the broker's capability mismatch policy, the message
+        is either re-routed a bounded number of times or rejected with a
+        structured result. It is never requeued immediately and infinitely.
+
+        :param message: received message.
+        :param check: failed capability check.
+        :param ack_controller: acknowledgement controller for the message.
+        :param raise_err: raise an error if cannot save result in
+            result_backend.
+        """
+        mismatches = [mismatch.as_dict() for mismatch in check.mismatches]
+        requeues = message.labels.get(CAPABILITY_REQUEUES_LABEL, 0) or 0
+        try:
+            requeues = int(requeues)
+        except (TypeError, ValueError):
+            requeues = 0
+        logger.warning(
+            "Task %s with ID %s cannot run on this worker. Capability mismatches: %s",
+            message.task_name,
+            message.task_id,
+            mismatches,
+        )
+        should_reroute = (
+            self.broker.capability_mismatch_policy == CapabilityMismatchPolicy.REROUTE
+            and requeues < self.broker.max_capability_requeues
+        )
+        if should_reroute:
+            message.labels[CAPABILITY_REQUEUES_LABEL] = requeues + 1
+            try:
+                await self.broker.kick(self.broker.formatter.dumps(message))
+            except Exception:
+                logger.exception(
+                    "Cannot re-route task %s with ID %s.",
+                    message.task_name,
+                    message.task_id,
+                )
+                return
+            logger.info(
+                "Re-routed task %s with ID %s (attempt %d/%d).",
+                message.task_name,
+                message.task_id,
+                requeues + 1,
+                self.broker.max_capability_requeues,
+            )
+            if ack_controller.is_ackable:
+                await ack_controller.ack()
+            return
+
+        result: TaskiqResult[Any] = TaskiqResult(
+            is_err=True,
+            log=None,
+            return_value=None,
+            execution_time=0.0,
+            error=CapabilityMismatchError(mismatches=mismatches),
+            labels={
+                **message.labels,
+                CAPABILITY_MISMATCHES_LABEL: mismatches,
+            },
+        )
+        try:
+            await self.broker.result_backend.set_result(message.task_id, result)
+        except Exception as exc:
+            logger.exception("Can't set result in result backend.")
+            if raise_err:
+                raise exc
+        if ack_controller.is_ackable:
+            await ack_controller.ack()
 
     async def run_task(  # noqa: C901, PLR0912, PLR0915
         self,
