@@ -199,6 +199,16 @@ lint.mccabe = { max-complexity = 10 }
   "S101",  # use of asserts detected
   "T201"  # print found
 ]
+"docs/guide/ref-params/*" = [
+  "D103",  # Missing docstring in public function
+  "D101",  # Missing docstring in public class
+  "D102",  # Missing docstring in public method
+  "ANN001",  # Missing type annotation for function argument
+  "ANN201",  # Missing return type annotation for public function
+  "S311",  # Standard pseudo-random generators
+  "S101",  # use of asserts detected
+  "T201",  # print found
+]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["taskiq_dependencies.Depends", "taskiq.TaskiqDepends"]

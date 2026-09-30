@@ -31,6 +31,7 @@ from taskiq.middlewares import (
     SimpleRetryMiddleware,
     SmartRetryMiddleware,
 )
+from taskiq.refs import Blob, BlobRefMiddleware, LocalFileBlobStore
 from taskiq.result import TaskiqResult
 from taskiq.scheduler.scheduled_task import ScheduledTask
 from taskiq.scheduler.scheduler import TaskiqScheduler
@@ -46,9 +47,12 @@ __all__ = [
     "AsyncResultBackend",
     "AsyncTaskiqDecoratedTask",
     "AsyncTaskiqTask",
+    "Blob",
+    "BlobRefMiddleware",
     "BrokerMessage",
     "Context",
     "InMemoryBroker",
+    "LocalFileBlobStore",
     "NoResultError",
     "PrometheusMiddleware",
     "ResultGetError",
