@@ -21,6 +21,7 @@ from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
 from taskiq.context import Context
 from taskiq.exceptions import NoResultError
+from taskiq.execution import ExecutionDecision, ExecutionDecisionType
 from taskiq.message import TaskiqMessage
 from taskiq.receiver.params_parser import parse_params
 from taskiq.result import TaskiqResult
@@ -186,13 +187,14 @@ class Receiver:
             "Function for task %s is resolved. Executing...",
             taskiq_msg.task_name,
         )
-        for middleware in self.broker.middlewares:
-            if middleware.__class__.pre_execute != TaskiqMiddleware.pre_execute:
-                taskiq_msg = await maybe_awaitable(
-                    middleware.pre_execute(
-                        taskiq_msg,
-                    ),
-                )
+        taskiq_msg = await self._run_pre_execute_middlewares(taskiq_msg)
+        if isinstance(taskiq_msg, ExecutionDecision):
+            await self._handle_execution_decision(
+                taskiq_msg,
+                ack_controller,
+                raise_err,
+            )
+            return
 
         ack_time = self._get_ack_time(taskiq_msg)
         logger.info(
@@ -231,6 +233,97 @@ class Receiver:
                 raise exc
 
         if ack_time == AcknowledgeType.WHEN_SAVED and ack_controller.is_ackable:
+            await ack_controller.ack()
+
+    async def _run_pre_execute_middlewares(
+        self,
+        message: TaskiqMessage,
+    ) -> TaskiqMessage | ExecutionDecision[Any]:
+        """Run all pre-execution middlewares in registration order."""
+        current_message = message
+        decision: ExecutionDecision[Any] | None = None
+        for middleware in self.broker.middlewares:
+            if middleware.__class__.pre_execute == TaskiqMiddleware.pre_execute:
+                continue
+            middleware_result = await maybe_awaitable(
+                middleware.pre_execute(current_message),
+            )
+            if decision is not None:
+                continue
+            if isinstance(middleware_result, ExecutionDecision):
+                decision = middleware_result
+                current_message = middleware_result
+            elif isinstance(middleware_result, TaskiqMessage):
+                current_message = middleware_result
+            elif middleware_result is None:
+                raise TypeError("pre_execute must return a message or decision.")
+            else:
+                raise TypeError(
+                    "pre_execute must return a TaskiqMessage or ExecutionDecision.",
+                )
+        return decision or current_message
+
+    async def _handle_execution_decision(
+        self,
+        decision: ExecutionDecision[Any],
+        ack_controller: AckController,
+        raise_err: bool,
+    ) -> None:
+        """Apply a decision returned by the pre-execution middleware chain."""
+        if decision.decision_type == ExecutionDecisionType.SKIP:
+            if ack_controller.is_ackable:
+                await ack_controller.ack()
+        elif decision.decision_type == ExecutionDecisionType.DEFER:
+            await self._handle_deferred_decision(decision, ack_controller)
+        else:
+            await self._handle_result_decision(
+                decision,
+                ack_controller,
+                raise_err,
+            )
+
+    async def _handle_deferred_decision(
+        self,
+        decision: ExecutionDecision[Any],
+        ack_controller: AckController,
+    ) -> None:
+        """Postpone a decision and acknowledge only after successful resending."""
+        await self.broker.kick(
+            self.broker.formatter.dumps(decision.to_message()),
+        )
+        if ack_controller.is_ackable:
+            await ack_controller.ack()
+
+    async def _handle_result_decision(
+        self,
+        decision: ExecutionDecision[Any],
+        ack_controller: AckController,
+        raise_err: bool,
+    ) -> None:
+        """Save a result supplied by a decision and acknowledge the delivery."""
+        result: TaskiqResult[Any] = TaskiqResult(
+            is_err=False,
+            return_value=decision.return_value,
+            execution_time=0,
+            labels=decision.labels,
+        )
+        for middleware in reversed(self.broker.middlewares):
+            if middleware.__class__.post_execute != TaskiqMiddleware.post_execute:
+                await maybe_awaitable(middleware.post_execute(decision, result))
+
+        try:
+            await self.broker.result_backend.set_result(decision.task_id, result)
+
+            for middleware in reversed(self.broker.middlewares):
+                if middleware.__class__.post_save != TaskiqMiddleware.post_save:
+                    await maybe_awaitable(middleware.post_save(decision, result))
+        except Exception as exc:
+            logger.exception("Can't set result in result backend.")
+            if raise_err:
+                raise exc
+            return
+
+        if ack_controller.is_ackable:
             await ack_controller.ack()
 
     def _get_ack_time(self, message: TaskiqMessage) -> AcknowledgeType:

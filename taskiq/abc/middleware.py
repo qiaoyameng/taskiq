@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:  # pragma: no cover  # pragma: no cover
     from taskiq.abc.broker import AsyncBroker
+    from taskiq.execution import ExecutionDecision
     from taskiq.message import TaskiqMessage
     from taskiq.result import TaskiqResult
 
@@ -83,8 +84,9 @@ class TaskiqMiddleware:  # pragma: no cover
         message: "TaskiqMessage",
     ) -> Union[
         "TaskiqMessage",
-        "Coroutine[Any, Any, TaskiqMessage]",
-        "CoroutineType[Any, Any, TaskiqMessage]",
+        "ExecutionDecision[Any]",
+        "Coroutine[Any, Any, TaskiqMessage | ExecutionDecision[Any]]",
+        "CoroutineType[Any, Any, TaskiqMessage | ExecutionDecision[Any]]",
     ]:
         """
         This hook is called before executing task.
@@ -93,7 +95,7 @@ class TaskiqMiddleware:  # pragma: no cover
         executes in the worker process.
 
         :param message: incoming parsed taskiq message.
-        :return: modified message.
+        :return: modified message or an execution decision.
         """
         return message
 

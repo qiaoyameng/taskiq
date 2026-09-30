@@ -24,6 +24,7 @@ from taskiq.exceptions import (
     TaskiqError,
     TaskiqResultTimeoutError,
 )
+from taskiq.execution import ExecutionDecision, ExecutionDecisionType
 from taskiq.funcs import gather
 from taskiq.message import BrokerMessage, TaskiqMessage
 from taskiq.middlewares import (
@@ -48,6 +49,8 @@ __all__ = [
     "AsyncTaskiqTask",
     "BrokerMessage",
     "Context",
+    "ExecutionDecision",
+    "ExecutionDecisionType",
     "InMemoryBroker",
     "NoResultError",
     "PrometheusMiddleware",

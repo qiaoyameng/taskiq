@@ -30,3 +30,35 @@ may use `self.broker` to do so.
 
 [Taskiq-pipelines](https://github.com/taskiq-python/taskiq-pipelines) uses middlewares to
 call next tasks.
+
+## Execution decisions
+
+The `pre_execute` hook can return an `ExecutionDecision` instead of a message.
+This allows a middleware to control execution without raising an exception, so
+decisions are not counted as task failures.
+
+- `ExecutionDecision.skip(message)` acknowledges the current message without
+  executing the task or saving a result.
+- `ExecutionDecision.defer(message, delay=...)` (alias: `postpone`) sends the
+  message again. The optional delay is stored in the conventional `delay`
+  label. The current message is acknowledged only after the new message is sent
+  successfully.
+- `ExecutionDecision.return_result(message, value)` does not execute the task,
+  but runs `post_execute`, saves a successful result with the supplied value,
+  runs `post_save`, and acknowledges the message.
+
+All `pre_execute` middlewares still run after a decision is returned. Later
+middlewares receive the same decision instance and can inspect it like a
+`TaskiqMessage`. Decisions are supported only from the `pre_execute` hook.
+
+```python
+from taskiq import ExecutionDecision, TaskiqMessage, TaskiqMiddleware
+
+
+class CacheMiddleware(TaskiqMiddleware):
+    async def pre_execute(self, message: TaskiqMessage):
+        cached_value = await self.get_cached_value(message.task_id)
+        if cached_value is not None:
+            return ExecutionDecision.return_result(message, cached_value)
+        return message
+```
