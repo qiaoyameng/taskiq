@@ -1,3 +1,4 @@
+import json
 from collections.abc import Coroutine
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ from typing import (
 from pydantic import BaseModel
 
 from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.capabilities import REQUIRED_CAPABILITIES_LABEL, normalize_requirements
 from taskiq.exceptions import SendTaskError
 from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
@@ -330,7 +332,17 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
             # can't be faithfully serialized, so don't ship it at all.
             if label == "types_of_exceptions":
                 continue
-            labels[label], labels_types[label] = prepare_label(label_val)
+            if label == REQUIRED_CAPABILITIES_LABEL:
+                # Capability requirements are normalized and shipped
+                # as a JSON string, so receivers can reliably parse
+                # them back into a mapping.
+                labels[label] = json.dumps(
+                    normalize_requirements(label_val),
+                    sort_keys=True,
+                )
+                labels_types[label] = prepare_label(labels[label])[1]
+            else:
+                labels[label], labels_types[label] = prepare_label(label_val)
 
         task_id = self.custom_task_id
         if task_id is None:

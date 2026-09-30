@@ -21,6 +21,7 @@ from uuid import uuid4
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.abc.serializer import TaskiqSerializer
 from taskiq.acks import AckableMessage
+from taskiq.capabilities import CapabilityMismatch, CapabilityMismatchAction
 from taskiq.decor import AsyncTaskiqDecoratedTask
 from taskiq.events import TaskiqEvents
 from taskiq.exceptions import TaskBrokerMismatchError
@@ -118,6 +119,36 @@ class AsyncBroker(ABC):
         self.is_worker_process = False
         # True only if broker runs in scheduler process.
         self.is_scheduler_process = False
+        # Maximum number of times a message may be rerouted
+        # because no worker had the required capabilities.
+        # After that the message is rejected, so unsupported
+        # tasks can never bounce between workers forever.
+        self.max_capability_reroutes: int = 3
+
+    async def on_capability_mismatch(
+        self,
+        message: BrokerMessage,
+        mismatch: CapabilityMismatch,
+    ) -> CapabilityMismatchAction:
+        """
+        Decide what to do with a message a worker cannot execute.
+
+        This method is called by receivers when a task message
+        declares capability requirements that the receiving worker
+        does not satisfy. The default policy reroutes the message
+        to give other workers a chance to execute it, but at most
+        ``max_capability_reroutes`` times; after that the message
+        is rejected and a failed result is stored.
+
+        Override this method to implement custom routing policies.
+
+        :param message: broker message that cannot be executed.
+        :param mismatch: structured reason why it cannot be executed.
+        :return: chosen action.
+        """
+        if mismatch.reroute_count <= self.max_capability_reroutes:
+            return CapabilityMismatchAction.REROUTE
+        return CapabilityMismatchAction.REJECT
 
     def find_task(self, task_name: str) -> AsyncTaskiqDecoratedTask[Any, Any] | None:
         """

@@ -19,8 +19,16 @@ from taskiq_dependencies import DependencyGraph
 from taskiq.abc.broker import AckableMessage, AsyncBroker
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
+from taskiq.capabilities import (
+    CAPABILITY_REROUTES_LABEL,
+    REQUIRED_CAPABILITIES_LABEL,
+    CapabilityMismatch,
+    CapabilityMismatchAction,
+    find_capability_problems,
+    parse_requirements,
+)
 from taskiq.context import Context
-from taskiq.exceptions import NoResultError
+from taskiq.exceptions import NoResultError, TaskCapabilitiesMismatchError
 from taskiq.message import TaskiqMessage
 from taskiq.receiver.params_parser import parse_params
 from taskiq.result import TaskiqResult
@@ -97,11 +105,17 @@ class Receiver:
         on_exit: Callable[["Receiver"], None] | None = None,
         max_tasks_to_execute: int | None = None,
         wait_tasks_timeout: float | None = None,
+        capabilities: dict[str, str | None] | None = None,
     ) -> None:
         self.broker = broker
         self.executor = executor
         self.run_startup = run_startup
         self.validate_params = validate_params
+        # Worker capabilities: a mapping of capability name to its
+        # version (None means unversioned). When None, capability
+        # requirements declared by tasks are not enforced at all,
+        # which matches the behaviour of older workers.
+        self.capabilities = capabilities
         self.task_signatures: dict[str, inspect.Signature] = {}
         self.task_hints: dict[str, dict[str, Any]] = {}
         self.dependency_graphs: dict[str, DependencyGraph] = {}
@@ -186,6 +200,15 @@ class Receiver:
             "Function for task %s is resolved. Executing...",
             taskiq_msg.task_name,
         )
+        if self.capabilities is not None:
+            mismatch = self._check_message_capabilities(taskiq_msg)
+            if mismatch is not None:
+                await self._handle_capability_mismatch(
+                    taskiq_msg,
+                    mismatch,
+                    ack_controller,
+                )
+                return
         for middleware in self.broker.middlewares:
             if middleware.__class__.pre_execute != TaskiqMiddleware.pre_execute:
                 taskiq_msg = await maybe_awaitable(
@@ -231,6 +254,104 @@ class Receiver:
                 raise exc
 
         if ack_time == AcknowledgeType.WHEN_SAVED and ack_controller.is_ackable:
+            await ack_controller.ack()
+
+    def _check_message_capabilities(
+        self,
+        message: TaskiqMessage,
+    ) -> CapabilityMismatch | None:
+        """
+        Verify that this worker satisfies the task's capability requirements.
+
+        :param message: received message.
+        :return: structured mismatch or None if the task can be executed.
+        """
+        reroute_count = self._next_reroute_count(message)
+        try:
+            required = parse_requirements(
+                message.labels.get(REQUIRED_CAPABILITIES_LABEL),
+            )
+        except ValueError as exc:
+            return CapabilityMismatch(
+                task_id=message.task_id,
+                task_name=message.task_name,
+                missing_capabilities=[],
+                incompatible_capabilities={},
+                invalid_requirements=str(exc),
+                reroute_count=reroute_count,
+            )
+        if not required:
+            return None
+        missing, incompatible = find_capability_problems(
+            required,
+            self.capabilities or {},
+        )
+        if not missing and not incompatible:
+            return None
+        return CapabilityMismatch(
+            task_id=message.task_id,
+            task_name=message.task_name,
+            missing_capabilities=missing,
+            incompatible_capabilities=incompatible,
+            reroute_count=reroute_count,
+        )
+
+    def _next_reroute_count(self, message: TaskiqMessage) -> int:
+        """Increment and store the capability reroute counter of a message."""
+        try:
+            reroute_count = int(message.labels.get(CAPABILITY_REROUTES_LABEL, 0))
+        except (TypeError, ValueError):
+            reroute_count = 0
+        reroute_count += 1
+        message.labels[CAPABILITY_REROUTES_LABEL] = str(reroute_count)
+        return reroute_count
+
+    async def _handle_capability_mismatch(
+        self,
+        message: TaskiqMessage,
+        mismatch: CapabilityMismatch,
+        ack_controller: AckController,
+    ) -> None:
+        """
+        Let the broker decide whether to reroute or reject the message.
+
+        The task function is never executed and no result of a successful
+        execution is produced: rerouting re-kicks the original message,
+        rejection stores a failed result with a structured reason.
+
+        :param message: received message.
+        :param mismatch: structured reason why it cannot be executed.
+        :param ack_controller: acknowledgement controller of the delivery.
+        """
+        broker_message = self.broker.formatter.dumps(message)
+        action = await self.broker.on_capability_mismatch(broker_message, mismatch)
+        if action == CapabilityMismatchAction.REROUTE:
+            logger.warning(
+                "Worker cannot execute task %s (id=%s): %s. Rerouting (%d/%d).",
+                message.task_name,
+                message.task_id,
+                mismatch.reason,
+                mismatch.reroute_count,
+                self.broker.max_capability_reroutes,
+            )
+            await self.broker.kick(broker_message)
+        else:
+            logger.warning(
+                "Rejecting task %s (id=%s): %s.",
+                message.task_name,
+                message.task_id,
+                mismatch.reason,
+            )
+            result: TaskiqResult[Any] = TaskiqResult(
+                is_err=True,
+                log=None,
+                return_value=None,
+                execution_time=0.0,
+                error=TaskCapabilitiesMismatchError(reason=mismatch.reason),
+                labels=message.labels,
+            )
+            await self.broker.result_backend.set_result(message.task_id, result)
+        if ack_controller.is_ackable:
             await ack_controller.ack()
 
     def _get_ack_time(self, message: TaskiqMessage) -> AcknowledgeType:

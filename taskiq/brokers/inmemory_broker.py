@@ -131,6 +131,7 @@ class InMemoryBroker(AsyncBroker):
         max_async_tasks_jitter: int = 0,
         propagate_exceptions: bool = True,
         await_inplace: bool = False,
+        capabilities: dict[str, str | None] | None = None,
     ) -> None:
         super().__init__()
         self.result_backend: InmemoryResultBackend[Any] = InmemoryResultBackend(
@@ -144,6 +145,7 @@ class InMemoryBroker(AsyncBroker):
             max_async_tasks=max_async_tasks,
             max_async_tasks_jitter=max_async_tasks_jitter,
             propagate_exceptions=propagate_exceptions,
+            capabilities=capabilities,
         )
         self.await_inplace = await_inplace
         self._running_tasks: set[asyncio.Task[Any]] = set()
