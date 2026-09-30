@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from taskiq.result import TaskiqResult
+from taskiq.result import StreamRead, StreamState, TaskiqResult
 
 if TYPE_CHECKING:  # pragma: no cover
     from taskiq.depends.progress_tracker import TaskProgress
@@ -76,3 +76,67 @@ class AsyncResultBackend(ABC, Generic[_ReturnType]):
 
         :param task_id: task's id.
         """
+
+    async def open_stream(self, task_id: str) -> StreamState[Any]:
+        """
+        Creates an empty ordered stream for a streaming task.
+
+        :param task_id: task's id.
+        :return: initial state of the stream.
+        """
+        raise NotImplementedError
+
+    async def add_stream_chunk(
+        self,
+        task_id: str,
+        data: Any,
+    ) -> int:
+        """
+        Appends one chunk to the stream.
+
+        Chunks receive monotonically increasing sequence
+        numbers, starting from zero.
+
+        :param task_id: task's id.
+        :param data: chunk yielded by the task.
+        :return: sequence number assigned to the chunk.
+        """
+        raise NotImplementedError
+
+    async def finish_stream(
+        self,
+        task_id: str,
+        result: TaskiqResult[Any],
+    ) -> None:
+        """
+        Writes the terminal state of a stream.
+
+        The stream is considered finished only after this call.
+        Both successful and failed executions must finish
+        their streams.
+
+        :param task_id: task's id.
+        :param result: final result of the task execution.
+        """
+        raise NotImplementedError
+
+    async def read_stream(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> StreamRead[Any]:
+        """
+        Reads stream chunks starting from the given sequence number.
+
+        Reads are idempotent: the same `since_seq` value always
+        returns the same fragments.
+
+        If the stream was evicted by a retention policy the
+        response status is EXPIRED. If it was never created
+        the status is NOT_FOUND.
+
+        :param task_id: task's id.
+        :param since_seq: sequence number to read from (inclusive).
+        :return: chunks and current state of the stream.
+        """
+        raise NotImplementedError

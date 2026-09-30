@@ -19,6 +19,14 @@ where you need actual results.
 
 This broker will always return `None` for any return_value. Please be careful.
 
+### InMemoryResultBackend
+
+Provided together with `InMemoryBroker`, this backend stores results, progress
+and streaming-task fragments in memory. Streams are bounded by
+`max_stored_results`; when a stream is evicted, reads report it as `EXPIRED`,
+which is different from `NOT_FOUND` for streams that never existed. See the
+[streaming results guide](../guide/streaming-results.md) for usage details.
+
 
 ## Official result backends
 

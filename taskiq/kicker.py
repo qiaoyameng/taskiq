@@ -2,7 +2,7 @@ from collections.abc import Coroutine
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta
 from logging import getLogger
-from types import CoroutineType
+from types import AsyncGeneratorType, CoroutineType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -113,6 +113,14 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
     @overload
     async def kiq(
         self: "AsyncKicker[_FuncParams, CoroutineType[Any, Any, _T]]",
+        *args: _FuncParams.args,
+        **kwargs: _FuncParams.kwargs,
+    ) -> AsyncTaskiqTask[_T]:  # pragma: no cover
+        ...
+
+    @overload
+    async def kiq(
+        self: "AsyncKicker[_FuncParams, AsyncGeneratorType[_T, None]]",
         *args: _FuncParams.args,
         **kwargs: _FuncParams.kwargs,
     ) -> AsyncTaskiqTask[_T]:  # pragma: no cover

@@ -12,6 +12,13 @@ from taskiq.events import TaskiqEvents
 from taskiq.exceptions import UnknownTaskError
 from taskiq.message import BrokerMessage
 from taskiq.receiver import Receiver
+from taskiq.result import (
+    StreamChunk,
+    StreamRead,
+    StreamReadStatus,
+    StreamState,
+    StreamStatus,
+)
 from taskiq.utils import maybe_awaitable
 
 _ReturnType = TypeVar("_ReturnType")
@@ -31,6 +38,26 @@ class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
         self.max_stored_results = max_stored_results
         self.results: OrderedDict[str, TaskiqResult[_ReturnType]] = OrderedDict()
         self.progress: OrderedDict[str, TaskProgress[Any]] = OrderedDict()
+        self.streams: OrderedDict[str, StreamState[Any]] = OrderedDict()
+        # IDs of streams that were removed by the retention policy.
+        # This lets us distinguish "never produced" from "already cleaned".
+        self.expired_streams: OrderedDict[str, None] = OrderedDict()
+
+    def _is_full(self, storage: "OrderedDict[str, Any]") -> bool:
+        """Check whether a bounded storage reached its capacity."""
+        return self.max_stored_results != -1 and len(storage) >= self.max_stored_results
+
+    def _evict_oldest_stream(self) -> str | None:
+        """Remove the oldest stream and remember it as expired."""
+        if not self.streams or not self._is_full(self.streams):
+            return None
+        evicted_id, _ = self.streams.popitem(last=False)
+        self.expired_streams[evicted_id] = None
+        if self.max_stored_results != -1 and (
+            len(self.expired_streams) > self.max_stored_results
+        ):
+            self.expired_streams.popitem(last=False)
+        return evicted_id
 
     async def set_result(self, task_id: str, result: TaskiqResult[_ReturnType]) -> None:
         """
@@ -60,7 +87,10 @@ class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
         :param task_id: id of a task to check.
         :return: True if ready.
         """
-        return task_id in self.results
+        if task_id in self.results:
+            return True
+        stream = self.streams.get(task_id)
+        return stream is not None and stream.result is not None
 
     async def get_result(
         self,
@@ -81,7 +111,12 @@ class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
         :param with_logs: this option is ignored.
         :return: result of a task execution.
         """
-        return self.results[task_id]
+        if task_id in self.results:
+            return self.results[task_id]
+        stream = self.streams.get(task_id)
+        if stream is not None and stream.result is not None:
+            return stream.result
+        raise KeyError(task_id)
 
     async def set_progress(
         self,
@@ -113,6 +148,112 @@ class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
         :return: progress or None
         """
         return self.progress.get(task_id)
+
+    async def open_stream(self, task_id: str) -> StreamState[Any]:
+        """
+        Create an empty stream for the task.
+
+        :param task_id: task id.
+        :return: created stream state.
+        """
+        self.expired_streams.pop(task_id, None)
+        while self._is_full(self.streams):
+            self._evict_oldest_stream()
+        stream = StreamState[Any](
+            task_id=task_id,
+            status=StreamStatus.RUNNING,
+        )
+        self.streams[task_id] = stream
+        return stream
+
+    async def add_stream_chunk(self, task_id: str, data: Any) -> int:
+        """
+        Append an ordered chunk to the stream.
+
+        :param task_id: task id.
+        :param data: chunk data.
+        :return: sequence number of the stored chunk.
+        """
+        stream = self.streams.get(task_id)
+        if stream is None:
+            # Writing to an expired stream is a no-op.
+            return -1
+        seq = len(stream.chunks)
+        stream.chunks.append(StreamChunk(seq=seq, data=data))
+        return seq
+
+    async def finish_stream(
+        self,
+        task_id: str,
+        result: TaskiqResult[Any],
+    ) -> None:
+        """
+        Write terminal status of the stream.
+
+        Chunks written before a failure are preserved,
+        but the stream is marked as failed.
+
+        :param task_id: task id.
+        :param result: final result of the task.
+        """
+        stream = self.streams.get(task_id)
+        if stream is None:
+            while self._is_full(self.streams):
+                self._evict_oldest_stream()
+            stream = StreamState[Any](
+                task_id=task_id,
+                status=StreamStatus.RUNNING,
+            )
+            self.streams[task_id] = stream
+        stream.status = (
+            StreamStatus.SUCCESS if not result.is_err else StreamStatus.FAILURE
+        )
+        stream.result = result
+
+    async def read_stream(
+        self,
+        task_id: str,
+        since_seq: int = 0,
+    ) -> StreamRead[Any]:
+        """
+        Read stream chunks from the given sequence number.
+
+        :param task_id: task id.
+        :param since_seq: sequence number to start reading from (inclusive).
+        :return: stream read response.
+        """
+        if task_id in self.expired_streams:
+            return StreamRead[Any](
+                task_id=task_id,
+                status=StreamReadStatus.EXPIRED,
+                seq=since_seq,
+            )
+        stream = self.streams.get(task_id)
+        if stream is None:
+            return StreamRead[Any](
+                task_id=task_id,
+                status=StreamReadStatus.NOT_FOUND,
+                seq=since_seq,
+            )
+
+        start = max(since_seq, 0)
+        chunks = stream.chunks[start:]
+        if stream.result is None:
+            status = StreamReadStatus.CHUNK
+            result = None
+        elif stream.result.is_err:
+            status = StreamReadStatus.FAILED
+            result = stream.result
+        else:
+            status = StreamReadStatus.COMPLETED
+            result = stream.result
+        return StreamRead[Any](
+            task_id=task_id,
+            status=status,
+            seq=start,
+            chunks=chunks,
+            result=result,
+        )
 
 
 class InMemoryBroker(AsyncBroker):

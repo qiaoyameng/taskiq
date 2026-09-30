@@ -2,7 +2,7 @@ import sys
 from collections.abc import Callable, Coroutine
 from copy import copy
 from datetime import datetime, timedelta
-from types import CoroutineType
+from types import AsyncGeneratorType, CoroutineType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -107,6 +107,13 @@ class AsyncTaskiqDecoratedTask(Generic[_FuncParams, _ReturnType]):
     @overload
     async def kiq(
         self: "AsyncTaskiqDecoratedTask[_FuncParams, Coroutine[Any, Any, _T]]",
+        *args: _FuncParams.args,
+        **kwargs: _FuncParams.kwargs,
+    ) -> AsyncTaskiqTask[_T]: ...
+
+    @overload
+    async def kiq(
+        self: "AsyncTaskiqDecoratedTask[_FuncParams, AsyncGeneratorType[_T, None]]",
         *args: _FuncParams.args,
         **kwargs: _FuncParams.kwargs,
     ) -> AsyncTaskiqTask[_T]: ...

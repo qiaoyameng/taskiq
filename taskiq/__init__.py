@@ -21,6 +21,8 @@ from taskiq.exceptions import (
     ResultIsReadyError,
     SecurityError,
     SendTaskError,
+    StreamExpiredError,
+    StreamNotFoundError,
     TaskiqError,
     TaskiqResultTimeoutError,
 )
@@ -31,7 +33,14 @@ from taskiq.middlewares import (
     SimpleRetryMiddleware,
     SmartRetryMiddleware,
 )
-from taskiq.result import TaskiqResult
+from taskiq.result import (
+    StreamChunk,
+    StreamRead,
+    StreamReadStatus,
+    StreamState,
+    StreamStatus,
+    TaskiqResult,
+)
 from taskiq.scheduler.scheduled_task import ScheduledTask
 from taskiq.scheduler.scheduler import TaskiqScheduler
 from taskiq.state import TaskiqState
@@ -59,6 +68,13 @@ __all__ = [
     "SendTaskError",
     "SimpleRetryMiddleware",
     "SmartRetryMiddleware",
+    "StreamChunk",
+    "StreamExpiredError",
+    "StreamNotFoundError",
+    "StreamRead",
+    "StreamReadStatus",
+    "StreamState",
+    "StreamStatus",
     "TaskiqDepends",
     "TaskiqError",
     "TaskiqEvents",

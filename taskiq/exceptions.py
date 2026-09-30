@@ -77,6 +77,20 @@ class ResultIsReadyError(ResultBackendError):
     __template__ = "Cannot find out if the task is ready"
 
 
+class StreamNotFoundError(ResultBackendError):
+    """Error if a stream for the task was never created."""
+
+    __template__ = "No stream was found for task {task_id}"
+    task_id: str
+
+
+class StreamExpiredError(ResultBackendError):
+    """Error if a stream was removed from the result backend by retention."""
+
+    __template__ = "Stream for task {task_id} has expired and was removed"
+    task_id: str
+
+
 class SecurityError(TaskiqError):
     """Security related exception."""
 

@@ -218,7 +218,8 @@ class Receiver:
                 await maybe_awaitable(middleware.post_execute(taskiq_msg, result))
 
         try:
-            if not isinstance(result.error, NoResultError):
+            is_stream = inspect.isasyncgenfunction(task.original_func)
+            if not isinstance(result.error, NoResultError) and not is_stream:
                 await self.broker.result_backend.set_result(taskiq_msg.task_id, result)
 
                 for middleware in reversed(self.broker.middlewares):
@@ -312,6 +313,8 @@ class Receiver:
             if PY_VERSION <= (3, 13)
             else inspect.iscoroutinefunction
         )
+        is_coroutine = True
+        is_stream = inspect.isasyncgenfunction(target)
         try:
             # We put kwargs resolving here,
             # to be able to catch any exception (for example ),
@@ -320,9 +323,8 @@ class Receiver:
                 kwargs = await dep_ctx.resolve_kwargs()
             # We update kwargs with kwargs from network.
             kwargs.update(message.kwargs)
-            is_coroutine = True
             # If the function is a coroutine, we await it.
-            if check_coroutine_func(target):
+            if is_stream or check_coroutine_func(target):
                 target_future = target(*message.args, **kwargs)
             else:
                 is_coroutine = False
@@ -349,7 +351,14 @@ class Receiver:
                         func,
                     )
             timeout = message.labels.get("timeout")
-            if timeout is not None:
+            if is_stream:
+                await self._consume_stream(
+                    target_future,
+                    message=message,
+                    timeout=timeout,
+                )
+                returned = None
+            elif timeout is not None:
                 if not is_coroutine:
                     logger.warning("Timeouts for sync tasks don't work in python well.")
 
@@ -357,13 +366,13 @@ class Receiver:
                     target_future = await target_future
                     if inspect.isawaitable(target_future):
                         target_future = await target_future
+                returned = target_future
 
             else:
                 target_future = await target_future
                 if inspect.isawaitable(target_future):
                     target_future = await target_future
-
-            returned = target_future
+                returned = target_future
         except NoResultError as no_res_exc:
             found_exception = no_res_exc
             logger.warning(
@@ -407,7 +416,66 @@ class Receiver:
                         ),
                     )
 
+        if is_stream and not isinstance(found_exception, NoResultError):
+            # The terminal state is what makes a stream finished.
+            # Chunks written before a failure must not be treated as success.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.broker.result_backend.finish_stream(
+                        message.task_id,
+                        result,
+                    )
+                except Exception:
+                    logger.exception("Can't finish stream in result backend.")
+
         return result
+
+    async def _consume_stream(
+        self,
+        agen: AsyncGenerator[Any, None],
+        message: TaskiqMessage,
+        timeout: Any,
+    ) -> None:
+        """
+        Drain an async generator task into the result backend.
+
+        Every yielded value is appended to the stream as an ordered
+        fragment. If iteration fails (or is cancelled), the generator
+        is always closed, so its cleanup code runs to completion.
+
+        :param agen: async generator produced by the task.
+        :param message: received message.
+        :param timeout: optional timeout label value.
+        """
+        result_backend = self.broker.result_backend
+        try:
+            await result_backend.open_stream(message.task_id)
+            if timeout is None:
+                return await self._drain_stream(agen, message)
+            with anyio.fail_after(float(timeout)):
+                return await self._drain_stream(agen, message)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await agen.aclose()
+
+    async def _drain_stream(
+        self,
+        agen: AsyncGenerator[Any, None],
+        message: TaskiqMessage,
+    ) -> None:
+        """
+        Append every yielded chunk to the stream in order.
+
+        :param agen: async generator produced by the task.
+        :param message: received message.
+        """
+        result_backend = self.broker.result_backend
+        while True:
+            try:
+                chunk = await agen.__anext__()
+            except StopAsyncIteration:
+                return
+            await result_backend.add_stream_chunk(message.task_id, chunk)
 
     async def listen(self, finish_event: asyncio.Event) -> None:  # pragma: no cover
         """
