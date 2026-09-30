@@ -20,10 +20,15 @@ class ProxyFormatter(TaskiqFormatter):
         :param message: message to send.
         :return: Dumped message.
         """
+        exclude = set()
+        if not message.blob_refs:
+            exclude.add("blob_refs")
         return BrokerMessage(
             task_id=message.task_id,
             task_name=message.task_name,
-            message=self.broker.serializer.dumpb(message.model_dump(mode="json")),
+            message=self.broker.serializer.dumpb(
+                message.model_dump(mode="json", exclude=exclude),
+            ),
             labels=message.labels,
         )
 

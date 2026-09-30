@@ -69,6 +69,41 @@ The default message format is:
 But this can be easily changed by creating your own implementation of the TaskiqFormatter class or TaskiqSerializer class.
 
 
+### Blob parameters
+
+Some brokers reject messages above a configured size limit. Use `Blob` to explicitly
+mark large `bytes` arguments for external storage. The broker message keeps only a
+content-addressed digest, byte length, and URI; nested arguments and repeated equal
+values share the same reference.
+
+```python
+from taskiq import Blob, InMemoryBroker, LocalFileBlobStore
+
+broker = InMemoryBroker().with_blob_store(
+    LocalFileBlobStore("/var/lib/taskiq/blobs"),
+)
+
+
+@broker.task
+async def process_file(contents: bytes) -> None: ...
+
+
+async def send() -> None:
+    await process_file.kiq(Blob(b"...large contents..."))
+```
+
+The producer uploads every marked value before calling the broker, so an upload
+failure prevents the message from being sent. Workers fetch referenced data and
+verify its SHA-256 digest and length before task execution. If a reference cannot
+be read or verified, the task is not called and the broker delivery is not
+acknowledged by Taskiq.
+
+`LocalFileBlobStore` stores content-addressed files and never deletes them as part
+of sending or receiving. Duplicate or delayed deliveries therefore remain safe;
+expired files are removed only by its retention-based cleanup, and successful reads
+renew an object's timestamp.
+
+
 ### Serializers
 
 Serializers define the format of the message but not the structure. For example, if you want to use msgpack or ORJson to serialize your message, you should update the serializer of your broker.

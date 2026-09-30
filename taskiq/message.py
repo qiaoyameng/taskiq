@@ -1,7 +1,8 @@
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from taskiq.blob_reference import BlobReference
 from taskiq.labels import parse_label
 
 
@@ -20,6 +21,7 @@ class TaskiqMessage(BaseModel):
     labels_types: dict[str, int] | None = None
     args: list[Any]
     kwargs: dict[str, Any]
+    blob_refs: dict[str, BlobReference] = Field(default_factory=dict)
 
     def parse_labels(self) -> None:
         """

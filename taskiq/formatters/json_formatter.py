@@ -12,10 +12,13 @@ class JSONFormatter(TaskiqFormatter):
         :param message: message to send.
         :return: Dumped message.
         """
+        exclude = set()
+        if not message.blob_refs:
+            exclude.add("blob_refs")
         return BrokerMessage(
             task_id=message.task_id,
             task_name=message.task_name,
-            message=message.model_dump_json().encode(),
+            message=message.model_dump_json(exclude=exclude).encode(),
             labels=message.labels,
         )
 

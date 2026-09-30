@@ -204,6 +204,8 @@ class InMemoryBroker(AsyncBroker):
                 await maybe_awaitable(middleware.startup())
 
         await self.result_backend.startup()
+        if self.blob_store is not None:
+            await self.blob_store.startup()
 
     async def shutdown(self) -> None:
         """Runs shutdown events for client and worker side."""
@@ -216,4 +218,6 @@ class InMemoryBroker(AsyncBroker):
                 await maybe_awaitable(middleware.shutdown())
 
         await self.result_backend.shutdown()
+        if self.blob_store is not None:
+            await self.blob_store.shutdown()
         self.executor.shutdown()

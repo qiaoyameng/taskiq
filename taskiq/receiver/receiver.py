@@ -19,6 +19,7 @@ from taskiq_dependencies import DependencyGraph
 from taskiq.abc.broker import AckableMessage, AsyncBroker
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
+from taskiq.blob_reference import restore_message_blobs
 from taskiq.context import Context
 from taskiq.exceptions import NoResultError
 from taskiq.message import TaskiqMessage
@@ -181,6 +182,20 @@ class Receiver:
             )
             if ack_controller.is_ackable:
                 await ack_controller.ack()
+            return
+        try:
+            await restore_message_blobs(
+                taskiq_msg,
+                self.broker.blob_store,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Cannot restore blob references for task %s with ID %s. "
+                "Skipping execution.",
+                taskiq_msg.task_name,
+                taskiq_msg.task_id,
+                exc_info=exc,
+            )
             return
         logger.debug(
             "Function for task %s is resolved. Executing...",

@@ -22,6 +22,14 @@ class BrokerError(TaskiqError):
     __template__ = "Base exception for all broker errors"
 
 
+class BlobStoreError(BrokerError):
+    """Blob storage operation failed."""
+
+    __template__ = "Cannot perform blob storage operation {operation} for {uri}"
+    operation: str
+    uri: str
+
+
 class ListenError(TaskiqError):
     """Error if the broker is unable to listen to the queue."""
 

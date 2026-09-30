@@ -39,6 +39,7 @@ else:
 
 
 if TYPE_CHECKING:  # pragma: no cover
+    from taskiq.abc.blob_store import AsyncBlobStore
     from taskiq.abc.formatter import TaskiqFormatter
     from taskiq.abc.result_backend import AsyncResultBackend
 
@@ -99,6 +100,7 @@ class AsyncBroker(ABC):
             )
         self.middlewares: list[TaskiqMiddleware] = []
         self.result_backend = result_backend
+        self.blob_store: AsyncBlobStore | None = None
         self.decorator_class = AsyncTaskiqDecoratedTask
         self.serializer: TaskiqSerializer = JSONSerializer()
         self.formatter: TaskiqFormatter = ProxyFormatter(self)
@@ -198,6 +200,8 @@ class AsyncBroker(ABC):
                 await maybe_awaitable(middleware.startup())
 
         await self.result_backend.startup()
+        if self.blob_store is not None:
+            await self.blob_store.startup()
 
     async def shutdown(self) -> None:
         """
@@ -219,6 +223,8 @@ class AsyncBroker(ABC):
                 await maybe_awaitable(middleware.shutdown())
 
         await self.result_backend.shutdown()
+        if self.blob_store is not None:
+            await self.blob_store.shutdown()
 
     @abstractmethod
     async def kick(
@@ -433,6 +439,19 @@ class AsyncBroker(ABC):
         :return: self
         """
         self.result_backend = result_backend
+        return self
+
+    def with_blob_store(
+        self,
+        blob_store: "AsyncBlobStore",
+    ) -> "Self":
+        """
+        Set a blob store for externally referenced parameters.
+
+        :param blob_store: blob store implementation.
+        :return: self
+        """
+        self.blob_store = blob_store
         return self
 
     def with_id_generator(

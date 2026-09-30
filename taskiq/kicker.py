@@ -16,6 +16,12 @@ from typing import (
 from pydantic import BaseModel
 
 from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.blob import Blob
+from taskiq.blob_reference import (
+    BLOB_PLACEHOLDER_KEY,
+    BlobReference,
+    encode_blob_value,
+)
 from taskiq.exceptions import SendTaskError
 from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
@@ -163,6 +169,7 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
             if middleware.__class__.pre_send != TaskiqMiddleware.pre_send:
                 message = await maybe_awaitable(middleware.pre_send(message))
         try:
+            await self._externalize_blobs(message)
             await self.broker.kick(self.broker.formatter.dumps(message))
         except Exception as exc:
             raise SendTaskError from exc
@@ -282,25 +289,98 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         return CreatedSchedule(self, source, scheduled)
 
     @classmethod
-    def _prepare_arg(cls, arg: Any) -> Any:
-        """
-        Parses argument if possible.
+    def _contains_blob(cls, arg: Any) -> bool:
+        """Return whether a value contains an explicitly marked parameter."""
+        if isinstance(arg, Blob):
+            return True
+        if isinstance(arg, (list, tuple, set, frozenset)):
+            return any(cls._contains_blob(item) for item in arg)
+        if isinstance(arg, dict):
+            return any(cls._contains_blob(item) for item in arg.values())
+        return False
 
-        This function is used to construct dicts
-        from pydantic models or dataclasses.
+    @classmethod
+    def _prepare_value(cls, arg: Any) -> Any:  # noqa: PLR0911
+        """
+        Convert structured arguments while preserving blob markers.
+
+        Ordinary values follow the previous behavior. Values containing blobs
+        are converted in Python mode so marked values remain available for
+        external storage.
 
         :param arg: argument to format.
         :return: Formatted argument.
         """
+        if isinstance(arg, Blob):
+            return arg
         if isinstance(arg, BaseModel):
-            arg = arg.model_dump(mode="json")
+            python_value = arg.model_dump(mode="python")
+            if not cls._contains_blob(python_value):
+                return arg.model_dump(mode="json")
+            return cls._prepare_value(python_value)
         if is_dataclass(arg):
             if isinstance(arg, type):
                 raise ValueError(
                     f"Cannot serialize types. The {arg} is not serializable.",
                 )
             arg = asdict(arg)
+        if isinstance(arg, list):
+            return [cls._prepare_value(item) for item in arg]
+        if isinstance(arg, tuple):
+            return tuple(cls._prepare_value(item) for item in arg)
+        if isinstance(arg, dict):
+            return {key: cls._prepare_value(item) for key, item in arg.items()}
         return arg
+
+    @classmethod
+    def _prepare_arg(cls, arg: Any) -> Any:
+        """Convert an argument into its message-ready Python representation."""
+        return cls._prepare_value(arg)
+
+    async def _externalize_value(
+        self,
+        value: Any,
+        references: dict[str, BlobReference],
+    ) -> Any:
+        """Recursively upload marked values and replace them with references."""
+        if isinstance(value, Blob):
+            if self.broker.blob_store is None:
+                raise ValueError(
+                    "Blob parameter requires a blob store. "
+                    "Configure one with broker.with_blob_store().",
+                )
+            digest, data = encode_blob_value(bytes(value))
+            reference = references.get(digest)
+            if reference is None:
+                uri = await self.broker.blob_store.put(digest, data)
+                reference = BlobReference(uri=uri, digest=digest, length=len(data))
+                references[digest] = reference
+            return {BLOB_PLACEHOLDER_KEY: digest}
+        if isinstance(value, list):
+            return [await self._externalize_value(item, references) for item in value]
+        if isinstance(value, tuple):
+            externalized = [
+                await self._externalize_value(item, references) for item in value
+            ]
+            return tuple(externalized)
+        if isinstance(value, dict):
+            return {
+                key: await self._externalize_value(item, references)
+                for key, item in value.items()
+            }
+        return value
+
+    async def _externalize_blobs(self, message: TaskiqMessage) -> None:
+        """Upload every marked parameter before the broker message is sent."""
+        references = dict(message.blob_refs)
+        message.args = [
+            await self._externalize_value(arg, references) for arg in message.args
+        ]
+        message.kwargs = {
+            key: await self._externalize_value(value, references)
+            for key, value in message.kwargs.items()
+        }
+        message.blob_refs = references
 
     def _prepare_message(
         self,
