@@ -17,9 +17,17 @@ import anyio
 from taskiq_dependencies import DependencyGraph
 
 from taskiq.abc.broker import AckableMessage, AsyncBroker
-from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.abc.middleware import TaskiqMiddleware, _call_pre_execute
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
 from taskiq.context import Context
+from taskiq.decisions import (
+    DeferTask,
+    ReturnResult,
+    SkipTask,
+    TaskExecutionDecision,
+    make_result,
+    reject_execution_decision,
+)
 from taskiq.exceptions import NoResultError
 from taskiq.message import TaskiqMessage
 from taskiq.receiver.params_parser import parse_params
@@ -186,12 +194,13 @@ class Receiver:
             "Function for task %s is resolved. Executing...",
             taskiq_msg.task_name,
         )
+        decision: TaskExecutionDecision | None = None
         for middleware in self.broker.middlewares:
             if middleware.__class__.pre_execute != TaskiqMiddleware.pre_execute:
-                taskiq_msg = await maybe_awaitable(
-                    middleware.pre_execute(
-                        taskiq_msg,
-                    ),
+                taskiq_msg, decision = await _call_pre_execute(
+                    middleware,
+                    taskiq_msg,
+                    decision,
                 )
 
         ack_time = self._get_ack_time(taskiq_msg)
@@ -201,37 +210,87 @@ class Receiver:
             taskiq_msg.task_id,
         )
 
-        if ack_time == AcknowledgeType.WHEN_RECEIVED and ack_controller.is_ackable:
-            await ack_controller.ack()
+        if decision is not None:
+            result = await self._apply_execution_decision(
+                message=taskiq_msg,
+                decision=decision,
+                ack_controller=ack_controller,
+                ack_time=ack_time,
+            )
+            if result is None:
+                return
+        else:
+            if ack_time == AcknowledgeType.WHEN_RECEIVED and ack_controller.is_ackable:
+                await ack_controller.ack()
 
-        result = await self.run_task(
-            target=task.original_func,
-            message=taskiq_msg,
-            ack_controller=ack_controller,
-        )
+            result = await self.run_task(
+                target=task.original_func,
+                message=taskiq_msg,
+                ack_controller=ack_controller,
+            )
 
-        if ack_time == AcknowledgeType.WHEN_EXECUTED and ack_controller.is_ackable:
+        if (
+            decision is None
+            and ack_time == AcknowledgeType.WHEN_EXECUTED
+            and ack_controller.is_ackable
+        ):
             await ack_controller.ack()
 
         for middleware in reversed(self.broker.middlewares):
             if middleware.__class__.post_execute != TaskiqMiddleware.post_execute:
-                await maybe_awaitable(middleware.post_execute(taskiq_msg, result))
+                hook_result: Any = await maybe_awaitable(
+                    middleware.post_execute(taskiq_msg, result),
+                )
+                reject_execution_decision(hook_result, "post_execute")
 
+        decision_result_saved = False
         try:
             if not isinstance(result.error, NoResultError):
                 await self.broker.result_backend.set_result(taskiq_msg.task_id, result)
+                decision_result_saved = isinstance(decision, ReturnResult)
 
                 for middleware in reversed(self.broker.middlewares):
                     if middleware.__class__.post_save != TaskiqMiddleware.post_save:
-                        await maybe_awaitable(middleware.post_save(taskiq_msg, result))
+                        hook_result = await maybe_awaitable(
+                            middleware.post_save(taskiq_msg, result),
+                        )
+                        reject_execution_decision(hook_result, "post_save")
 
         except Exception as exc:
             logger.exception("Can't set result in result backend.")
             if raise_err:
                 raise exc
 
-        if ack_time == AcknowledgeType.WHEN_SAVED and ack_controller.is_ackable:
+        should_ack_after_save = ack_time == AcknowledgeType.WHEN_SAVED or (
+            decision_result_saved and ack_time != AcknowledgeType.MANUAL
+        )
+        if should_ack_after_save and ack_controller.is_ackable:
             await ack_controller.ack()
+
+    async def _apply_execution_decision(
+        self,
+        message: TaskiqMessage,
+        decision: TaskExecutionDecision,
+        ack_controller: AckController,
+        ack_time: AcknowledgeType,
+    ) -> TaskiqResult[Any] | None:
+        """Apply a decision returned by a pre-execute middleware."""
+        if isinstance(decision, SkipTask):
+            if ack_time != AcknowledgeType.MANUAL and ack_controller.is_ackable:
+                await ack_controller.ack()
+            return None
+
+        if isinstance(decision, DeferTask):
+            message.labels["delay"] = decision.delay
+            await self.broker.kick(self.broker.formatter.dumps(message))
+            if ack_time != AcknowledgeType.MANUAL and ack_controller.is_ackable:
+                await ack_controller.ack()
+            return None
+
+        if isinstance(decision, ReturnResult):
+            return make_result(decision.result, message.labels)
+
+        raise TypeError(f"Unsupported execution decision: {type(decision).__name__}.")
 
     def _get_ack_time(self, message: TaskiqMessage) -> AcknowledgeType:
         """
@@ -399,13 +458,14 @@ class Receiver:
         if found_exception is not None:
             for middleware in reversed(self.broker.middlewares):
                 if middleware.__class__.on_error != TaskiqMiddleware.on_error:
-                    await maybe_awaitable(
+                    hook_result: Any = await maybe_awaitable(
                         middleware.on_error(
                             message,
                             result,
                             found_exception,
                         ),
                     )
+                    reject_execution_decision(hook_result, "on_error")
 
         return result
 

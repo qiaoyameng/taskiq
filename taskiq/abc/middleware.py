@@ -1,11 +1,20 @@
+import inspect
 from collections.abc import Coroutine
 from types import CoroutineType
 from typing import TYPE_CHECKING, Any, Union
 
-if TYPE_CHECKING:  # pragma: no cover  # pragma: no cover
+from taskiq.decisions import TaskExecutionDecision
+from taskiq.message import TaskiqMessage
+from taskiq.utils import maybe_awaitable
+
+if TYPE_CHECKING:
     from taskiq.abc.broker import AsyncBroker
-    from taskiq.message import TaskiqMessage
     from taskiq.result import TaskiqResult
+
+MiddlewarePreExecuteResult = Union[
+    "TaskiqMessage",
+    "TaskExecutionDecision",
+]
 
 
 class TaskiqMiddleware:  # pragma: no cover
@@ -81,10 +90,11 @@ class TaskiqMiddleware:  # pragma: no cover
     def pre_execute(
         self,
         message: "TaskiqMessage",
+        decision: "TaskExecutionDecision | None" = None,
     ) -> Union[
-        "TaskiqMessage",
-        "Coroutine[Any, Any, TaskiqMessage]",
-        "CoroutineType[Any, Any, TaskiqMessage]",
+        "MiddlewarePreExecuteResult",
+        "Coroutine[Any, Any, MiddlewarePreExecuteResult]",
+        "CoroutineType[Any, Any, MiddlewarePreExecuteResult]",
     ]:
         """
         This hook is called before executing task.
@@ -93,6 +103,7 @@ class TaskiqMiddleware:  # pragma: no cover
         executes in the worker process.
 
         :param message: incoming parsed taskiq message.
+        :param decision: decision made by an earlier middleware.
         :return: modified message.
         """
         return message
@@ -140,3 +151,36 @@ class TaskiqMiddleware:  # pragma: no cover
         :param result: returned value.
         :param exception: found exception.
         """
+
+
+async def _call_pre_execute(
+    middleware: "TaskiqMiddleware",
+    message: "TaskiqMessage",
+    decision: "TaskExecutionDecision | None",
+) -> tuple["TaskiqMessage", "TaskExecutionDecision | None"]:
+    """Call a pre-execute hook while preserving its message and decision."""
+    positional_parameters = [
+        parameter
+        for parameter in inspect.signature(middleware.pre_execute).parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    has_var_positional = any(
+        parameter.kind == inspect.Parameter.VAR_POSITIONAL
+        for parameter in inspect.signature(middleware.pre_execute).parameters.values()
+    )
+    arguments = (
+        (message, decision)
+        if len(positional_parameters) >= 2 or has_var_positional
+        else (message,)
+    )
+    returned = await maybe_awaitable(middleware.pre_execute(*arguments))
+    if returned is None:
+        return message, decision
+    if isinstance(returned, TaskExecutionDecision):
+        return message, returned
+    if isinstance(returned, TaskiqMessage):
+        return returned, decision
+    raise TypeError(
+        "pre_execute must return a TaskiqMessage, TaskExecutionDecision, or None.",
+    )

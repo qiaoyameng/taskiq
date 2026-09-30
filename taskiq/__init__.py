@@ -14,6 +14,15 @@ from taskiq.brokers.inmemory_broker import InMemoryBroker
 from taskiq.brokers.shared_broker import async_shared_broker
 from taskiq.brokers.zmq_broker import ZeroMQBroker
 from taskiq.context import Context
+from taskiq.decisions import (
+    DeferExecution,
+    DeferTask,
+    ProvideResult,
+    ReturnResult,
+    SkipExecution,
+    SkipTask,
+    TaskExecutionDecision,
+)
 from taskiq.events import TaskiqEvents
 from taskiq.exceptions import (
     NoResultError,
@@ -48,17 +57,24 @@ __all__ = [
     "AsyncTaskiqTask",
     "BrokerMessage",
     "Context",
+    "DeferExecution",
+    "DeferTask",
     "InMemoryBroker",
     "NoResultError",
     "PrometheusMiddleware",
+    "ProvideResult",
     "ResultGetError",
     "ResultIsReadyError",
+    "ReturnResult",
     "ScheduleSource",
     "ScheduledTask",
     "SecurityError",
     "SendTaskError",
     "SimpleRetryMiddleware",
+    "SkipExecution",
+    "SkipTask",
     "SmartRetryMiddleware",
+    "TaskExecutionDecision",
     "TaskiqDepends",
     "TaskiqError",
     "TaskiqEvents",

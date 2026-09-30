@@ -227,6 +227,11 @@ Here are methods you can implement in the order they are executed:
 - `post_execute` - executed after the message was executed.
 - `post_save` - executed after the result was saved in the result backend.
 
+`pre_execute` can additionally return `SkipTask`, `DeferTask`, or `ReturnResult`
+to control execution without raising an exception. See
+[Middlewares](../../extending-taskiq/middleware.md#execution-decisions) for
+result-saving and acknowledgement semantics.
+
 You can use sync or async hooks without changing anything, but adding async to the hook signature.
 
 ::: warning important note

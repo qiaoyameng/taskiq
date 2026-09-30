@@ -16,6 +16,7 @@ from typing import (
 from pydantic import BaseModel
 
 from taskiq.abc.middleware import TaskiqMiddleware
+from taskiq.decisions import reject_execution_decision
 from taskiq.exceptions import SendTaskError
 from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
@@ -161,7 +162,11 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         message = self._prepare_message(*args, **kwargs)
         for middleware in self.broker.middlewares:
             if middleware.__class__.pre_send != TaskiqMiddleware.pre_send:
-                message = await maybe_awaitable(middleware.pre_send(message))
+                pre_send_result: Any = await maybe_awaitable(
+                    middleware.pre_send(message),
+                )
+                reject_execution_decision(pre_send_result, "pre_send")
+                message = pre_send_result
         try:
             await self.broker.kick(self.broker.formatter.dumps(message))
         except Exception as exc:
@@ -169,7 +174,10 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
 
         for middleware in reversed(self.broker.middlewares):
             if middleware.__class__.post_send != TaskiqMiddleware.post_send:
-                await maybe_awaitable(middleware.post_send(message))
+                post_send_result: Any = await maybe_awaitable(
+                    middleware.post_send(message),
+                )
+                reject_execution_decision(post_send_result, "post_send")
 
         return AsyncTaskiqTask(
             task_id=message.task_id,
