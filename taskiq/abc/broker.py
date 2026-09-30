@@ -21,9 +21,10 @@ from uuid import uuid4
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.abc.serializer import TaskiqSerializer
 from taskiq.acks import AckableMessage
+from taskiq.batch import BatchItemStatus, BatchKicker, BrokerBatchReceipt
 from taskiq.decor import AsyncTaskiqDecoratedTask
 from taskiq.events import TaskiqEvents
-from taskiq.exceptions import TaskBrokerMismatchError
+from taskiq.exceptions import TaskBrokerMismatchError, TaskRejectedError
 from taskiq.formatters.proxy_formatter import ProxyFormatter
 from taskiq.message import BrokerMessage
 from taskiq.result_backends.dummy import DummyResultBackend
@@ -236,6 +237,85 @@ class AsyncBroker(ABC):
 
         :param message: name of a task.
         """
+
+    async def kick_batch(
+        self,
+        messages: list[BrokerMessage],
+    ) -> list["BrokerBatchReceipt"]:
+        """
+        Send a group of prepared messages and return per-item receipts.
+
+        Brokers with native batch support should override this method.
+        The default implementation is an explicit, clearly marked
+        per-item fallback: it calls :meth:`kick` sequentially for each
+        message and records the individual outcomes.
+
+        Returned receipts must contain one entry per input message,
+        ordered to match ``messages``.
+
+        :param messages: prepared broker messages.
+        :return: one receipt per message, in input order.
+        """
+        receipts: list[BrokerBatchReceipt] = []
+        for index, message in enumerate(messages):
+            try:
+                await self.kick(message)
+            except TaskRejectedError as exc:
+                # The broker explicitly refused this message; it was not
+                # enqueued and is safe to consider rejected.
+                receipts.append(
+                    BrokerBatchReceipt(
+                        index=index,
+                        status=BatchItemStatus.REJECTED,
+                        error=exc,
+                    ),
+                )
+                # The sequential fallback aborts on the first hard
+                # failure. Later messages were never attempted...
+                for remaining_index in range(index + 1, len(messages)):
+                    receipts.append(
+                        BrokerBatchReceipt(
+                            index=remaining_index,
+                            status=BatchItemStatus.NOT_SENT,
+                        ),
+                    )
+                return receipts
+            except Exception as exc:
+                # Connection drop, timeout, etc. The message might still
+                # have reached the broker, so this is unknown -- never
+                # "not sent". The fallback stops here.
+                receipts.append(
+                    BrokerBatchReceipt(
+                        index=index,
+                        status=BatchItemStatus.UNKNOWN,
+                        error=exc,
+                    ),
+                )
+                for remaining_index in range(index + 1, len(messages)):
+                    receipts.append(
+                        BrokerBatchReceipt(
+                            index=remaining_index,
+                            status=BatchItemStatus.NOT_SENT,
+                        ),
+                    )
+                return receipts
+            receipts.append(
+                BrokerBatchReceipt(
+                    index=index,
+                    status=BatchItemStatus.ACCEPTED,
+                ),
+            )
+        return receipts
+
+    def batch_kicker(self) -> "BatchKicker":
+        """
+        Create a batch kicker bound to this broker.
+
+        Every task added to the returned kicker must use this broker.
+
+        :return: a new :class:`BatchKicker`.
+        """
+        return BatchKicker(broker=self)
 
     @abstractmethod
     def listen(self) -> AsyncGenerator[bytes | AckableMessage, None]:

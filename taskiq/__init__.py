@@ -10,6 +10,13 @@ from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.abc.result_backend import AsyncResultBackend
 from taskiq.abc.schedule_source import ScheduleSource
 from taskiq.acks import AckableMessage, AcknowledgeType
+from taskiq.batch import (
+    BatchItemReceipt,
+    BatchItemStatus,
+    BatchKicker,
+    BatchKickResult,
+    BrokerBatchReceipt,
+)
 from taskiq.brokers.inmemory_broker import InMemoryBroker
 from taskiq.brokers.shared_broker import async_shared_broker
 from taskiq.brokers.zmq_broker import ZeroMQBroker
@@ -46,6 +53,11 @@ __all__ = [
     "AsyncResultBackend",
     "AsyncTaskiqDecoratedTask",
     "AsyncTaskiqTask",
+    "BatchItemReceipt",
+    "BatchItemStatus",
+    "BatchKickResult",
+    "BatchKicker",
+    "BrokerBatchReceipt",
     "BrokerMessage",
     "Context",
     "InMemoryBroker",
