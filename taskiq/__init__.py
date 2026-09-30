@@ -21,6 +21,8 @@ from taskiq.exceptions import (
     ResultIsReadyError,
     SecurityError,
     SendTaskError,
+    StreamingNotSupportedError,
+    StreamNotFoundError,
     TaskiqError,
     TaskiqResultTimeoutError,
 )
@@ -35,6 +37,9 @@ from taskiq.result import TaskiqResult
 from taskiq.scheduler.scheduled_task import ScheduledTask
 from taskiq.scheduler.scheduler import TaskiqScheduler
 from taskiq.state import TaskiqState
+from taskiq.stream import StreamChunk, StreamRead, StreamState
+from taskiq.stream_decor import AsyncStreamTaskiqDecoratedTask
+from taskiq.stream_task import AsyncStreamTaskiqTask
 from taskiq.task import AsyncTaskiqTask
 
 __version__ = version("taskiq")
@@ -44,6 +49,8 @@ __all__ = [
     "AcknowledgeType",
     "AsyncBroker",
     "AsyncResultBackend",
+    "AsyncStreamTaskiqDecoratedTask",
+    "AsyncStreamTaskiqTask",
     "AsyncTaskiqDecoratedTask",
     "AsyncTaskiqTask",
     "BrokerMessage",
@@ -59,6 +66,11 @@ __all__ = [
     "SendTaskError",
     "SimpleRetryMiddleware",
     "SmartRetryMiddleware",
+    "StreamChunk",
+    "StreamNotFoundError",
+    "StreamRead",
+    "StreamState",
+    "StreamingNotSupportedError",
     "TaskiqDepends",
     "TaskiqError",
     "TaskiqEvents",

@@ -1,3 +1,4 @@
+import collections.abc
 import os
 import sys
 import warnings
@@ -13,6 +14,8 @@ from typing import (
     ParamSpec,
     TypeAlias,
     TypeVar,
+    get_args,
+    get_origin,
     get_type_hints,
     overload,
 )
@@ -29,6 +32,7 @@ from taskiq.message import BrokerMessage
 from taskiq.result_backends.dummy import DummyResultBackend
 from taskiq.serializers.json_serializer import JSONSerializer
 from taskiq.state import TaskiqState
+from taskiq.stream_decor import AsyncStreamTaskiqDecoratedTask
 from taskiq.utils import maybe_awaitable
 from taskiq.warnings import TaskiqDeprecationWarning
 
@@ -331,6 +335,13 @@ class AsyncBroker(ABC):
                 return_type = None
                 if "return" in sign:
                     return_type = sign["return"]
+                if return_type is not None and hasattr(return_type, "__args__"):
+                    origin = get_origin(return_type)
+                    if isinstance(
+                        origin,
+                        type,
+                    ) and issubclass(origin, collections.abc.AsyncGenerator):
+                        return_type = get_args(return_type)[0]
 
                 decorated_task = wrapper(
                     self.decorator_class(
@@ -381,6 +392,49 @@ class AsyncBroker(ABC):
         :returns: registered task.
         """
         return self.task(task_name=task_name, **labels)(func)
+
+    def stream_task(
+        self,
+        task_name: str | None = None,
+        **labels: Any,
+    ) -> Any:
+        """
+        Decorator for tasks that produce ordered streaming fragments.
+
+        The decorated function must be an asynchronous generator. Every
+        value it yields is stored in the result backend as an ordered
+        fragment; when the generator finishes, a success or failure
+        terminal state is written. Fragments can be consumed and
+        re-consumed starting from any sequence number.
+
+        :param task_name: custom name, defaults to the function's name.
+        :param labels: additional labels for the task.
+        :returns: an ``AsyncStreamTaskiqDecoratedTask`` instance.
+        """
+        original_decorator_class = self.decorator_class
+        self.decorator_class = AsyncStreamTaskiqDecoratedTask
+        try:
+            if callable(task_name):
+                return self.task(task_name)
+            return self.task(task_name=task_name, **labels)
+        finally:
+            self.decorator_class = original_decorator_class
+
+    def register_stream_task(
+        self,
+        func: Callable[_FuncParams, AsyncGenerator[_ReturnType, None]],
+        task_name: str | None = None,
+        **labels: Any,
+    ) -> AsyncStreamTaskiqDecoratedTask[_FuncParams, _ReturnType]:
+        """
+        Register an async generator function as a streaming task.
+
+        :param func: async generator function to register.
+        :param task_name: custom name, defaults to the function's name.
+        :param labels: additional labels for the task.
+        :returns: registered streaming task.
+        """
+        return self.stream_task(task_name=task_name, **labels)(func)
 
     def on_event(self, *events: TaskiqEvents) -> Callable[[EventHandler], EventHandler]:
         """

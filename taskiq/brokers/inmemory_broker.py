@@ -2,6 +2,8 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any, TypeVar
 
 from taskiq.abc.broker import AsyncBroker
@@ -9,12 +11,24 @@ from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.abc.result_backend import AsyncResultBackend, TaskiqResult
 from taskiq.depends.progress_tracker import TaskProgress
 from taskiq.events import TaskiqEvents
-from taskiq.exceptions import UnknownTaskError
+from taskiq.exceptions import StreamNotFoundError, UnknownTaskError
 from taskiq.message import BrokerMessage
 from taskiq.receiver import Receiver
+from taskiq.stream import StreamChunk, StreamRead, StreamState
 from taskiq.utils import maybe_awaitable
 
 _ReturnType = TypeVar("_ReturnType")
+
+
+@dataclass(slots=True)
+class _StreamEntry:
+    """Internal representation of a single stream."""
+
+    chunks: OrderedDict[int, StreamChunk[Any]] = field(default_factory=OrderedDict)
+    state: StreamState = StreamState.PENDING
+    error: BaseException | None = None
+    updated_at: float = 0.0
+    condition: asyncio.Condition | None = None
 
 
 class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
@@ -27,10 +41,22 @@ class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
     It stores all results in a dict in memory.
     """
 
-    def __init__(self, max_stored_results: int = 100) -> None:
+    def __init__(
+        self,
+        max_stored_results: int = 100,
+        max_stored_stream_results: int = 1000,
+        stream_result_ttl: float = 3600.0,
+    ) -> None:
         self.max_stored_results = max_stored_results
+        self.max_stored_stream_results = max_stored_stream_results
+        self.stream_result_ttl = stream_result_ttl
         self.results: OrderedDict[str, TaskiqResult[_ReturnType]] = OrderedDict()
         self.progress: OrderedDict[str, TaskProgress[Any]] = OrderedDict()
+        self.streams: OrderedDict[str, _StreamEntry] = OrderedDict()
+        # Tombstones keep task ids of streams removed by the retention
+        # policy, so consumers can distinguish "never produced" from
+        # "already cleaned up".
+        self.stream_tombstones: OrderedDict[str, float] = OrderedDict()
 
     async def set_result(self, task_id: str, result: TaskiqResult[_ReturnType]) -> None:
         """
@@ -114,6 +140,182 @@ class InmemoryResultBackend(AsyncResultBackend[_ReturnType]):
         """
         return self.progress.get(task_id)
 
+    async def start_stream(self, task_id: str) -> None:
+        """
+        Create a stream entry.
+
+        Does nothing if the stream already exists, which makes it safe
+        to call both from the client (right after kicking) and from the
+        worker (before producing fragments).
+
+        :param task_id: id of a task.
+        """
+        self._purge_expired_tombstones()
+        existing = self.streams.get(task_id)
+        if existing is not None:
+            return
+        now = monotonic()
+        entry = _StreamEntry(
+            updated_at=now,
+            condition=asyncio.Condition(),
+        )
+        self.streams[task_id] = entry
+        self._evict_finished_streams()
+
+    async def append_stream_chunk(
+        self,
+        task_id: str,
+        chunk: StreamChunk[Any],
+    ) -> None:
+        """
+        Append a fragment to a stream.
+
+        Old fragments of the same stream may be removed by the retention
+        policy; waiting consumers are always notified about new data.
+
+        :param task_id: id of a task.
+        :param chunk: ordered fragment.
+        """
+        entry = self.streams.get(task_id)
+        if entry is None:
+            await self.start_stream(task_id)
+            entry = self.streams[task_id]
+        if (
+            self.max_stored_stream_results != -1
+            and len(entry.chunks) >= self.max_stored_stream_results
+        ):
+            entry.chunks.popitem(last=False)
+        entry.chunks[chunk.seq] = chunk
+        entry.updated_at = monotonic()
+        if entry.condition is not None:
+            async with entry.condition:
+                entry.condition.notify_all()
+
+    async def finish_stream(
+        self,
+        task_id: str,
+        state: str,
+        error: BaseException | None = None,
+    ) -> None:
+        """
+        Write the terminal state of a stream.
+
+        Only after this call the stream can be considered finished.
+
+        :param task_id: id of a task.
+        :param state: terminal state name.
+        :param error: optional failure exception.
+        """
+        entry = self.streams.get(task_id)
+        if entry is None:
+            await self.start_stream(task_id)
+            entry = self.streams[task_id]
+        entry.state = StreamState(state)
+        entry.error = error
+        entry.updated_at = monotonic()
+        if entry.condition is not None:
+            async with entry.condition:
+                entry.condition.notify_all()
+
+    async def read_stream(
+        self,
+        task_id: str,
+        after_seq: int = -1,
+        timeout: float = 0.0,
+    ) -> StreamRead[Any]:
+        """
+        Read fragments of a stream starting after ``after_seq``.
+
+        Pending streams block up to ``timeout`` seconds for new
+        fragments; finished streams return immediately.
+
+        :param task_id: id of a task.
+        :param after_seq: last consumed sequence number.
+        :param timeout: max wait time for new fragments.
+        :raises StreamNotFoundError: unknown or expired stream.
+        :return: available fragments and the current stream state.
+        """
+        self._purge_expired_streams()
+        self._purge_expired_tombstones()
+        entry = self._get_stream_or_raise(task_id)
+        chunks = self._select_chunks(entry, after_seq)
+        if entry.state == StreamState.PENDING and not chunks and timeout > 0:
+            if entry.condition is None:
+                entry.condition = asyncio.Condition()
+            condition = entry.condition
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            async with condition:
+                while entry.state == StreamState.PENDING:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(condition.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+            chunks = self._select_chunks(entry, after_seq)
+        return StreamRead(
+            chunks=chunks,
+            state=entry.state,
+            error=entry.error,
+        )
+
+    def _get_stream_or_raise(self, task_id: str) -> _StreamEntry:
+        entry = self.streams.get(task_id)
+        if entry is None:
+            raise StreamNotFoundError(
+                task_id=task_id,
+                expired=task_id in self.stream_tombstones,
+            )
+        return entry
+
+    @staticmethod
+    def _select_chunks(
+        entry: _StreamEntry,
+        after_seq: int,
+    ) -> list[StreamChunk[Any]]:
+        return [chunk for seq, chunk in entry.chunks.items() if seq > after_seq]
+
+    def _purge_expired_tombstones(self) -> None:
+        if self.stream_result_ttl <= 0:
+            return
+        deadline = monotonic() - self.stream_result_ttl
+        expired_tombstones = [
+            task_id
+            for task_id, removed_at in self.stream_tombstones.items()
+            if removed_at <= deadline
+        ]
+        for task_id in expired_tombstones:
+            self.stream_tombstones.pop(task_id)
+
+    def _purge_expired_streams(self) -> None:
+        if self.stream_result_ttl <= 0:
+            return
+        deadline = monotonic() - self.stream_result_ttl
+        expired_streams = [
+            task_id
+            for task_id, entry in self.streams.items()
+            if entry.state != StreamState.PENDING and entry.updated_at <= deadline
+        ]
+        for task_id in expired_streams:
+            self.streams.pop(task_id)
+            self.stream_tombstones[task_id] = monotonic()
+
+    def _evict_finished_streams(self) -> None:
+        if self.max_stored_results == -1:
+            return
+        while len(self.streams) > self.max_stored_results:
+            for task_id, entry in self.streams.items():
+                if entry.state != StreamState.PENDING:
+                    self.streams.pop(task_id)
+                    self.stream_tombstones[task_id] = monotonic()
+                    break
+            else:
+                # Only active streams remain; better exceed the limit
+                # than to remove a stream that may still produce data.
+                break
+
 
 class InMemoryBroker(AsyncBroker):
     """
@@ -126,6 +328,8 @@ class InMemoryBroker(AsyncBroker):
         self,
         sync_tasks_pool_size: int = 4,
         max_stored_results: int = 100,
+        max_stored_stream_results: int = 1000,
+        stream_result_ttl: float = 3600.0,
         cast_types: bool = True,
         max_async_tasks: int = 30,
         max_async_tasks_jitter: int = 0,
@@ -135,6 +339,8 @@ class InMemoryBroker(AsyncBroker):
         super().__init__()
         self.result_backend: InmemoryResultBackend[Any] = InmemoryResultBackend(
             max_stored_results=max_stored_results,
+            max_stored_stream_results=max_stored_stream_results,
+            stream_result_ttl=stream_result_ttl,
         )
         self.executor = ThreadPoolExecutor(sync_tasks_pool_size)
         self.receiver = Receiver(

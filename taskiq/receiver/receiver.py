@@ -25,6 +25,7 @@ from taskiq.message import TaskiqMessage
 from taskiq.receiver.params_parser import parse_params
 from taskiq.result import TaskiqResult
 from taskiq.state import TaskiqState
+from taskiq.stream import StreamChunk, StreamState
 from taskiq.utils import maybe_awaitable
 
 logger = getLogger(__name__)
@@ -186,6 +187,7 @@ class Receiver:
             "Function for task %s is resolved. Executing...",
             taskiq_msg.task_name,
         )
+        is_stream = self._is_stream_task(task, taskiq_msg)
         for middleware in self.broker.middlewares:
             if middleware.__class__.pre_execute != TaskiqMiddleware.pre_execute:
                 taskiq_msg = await maybe_awaitable(
@@ -204,11 +206,17 @@ class Receiver:
         if ack_time == AcknowledgeType.WHEN_RECEIVED and ack_controller.is_ackable:
             await ack_controller.ack()
 
-        result = await self.run_task(
-            target=task.original_func,
-            message=taskiq_msg,
-            ack_controller=ack_controller,
-        )
+        if is_stream:
+            result = await self.run_stream_task(
+                target=task.original_func,
+                message=taskiq_msg,
+            )
+        else:
+            result = await self.run_task(
+                target=task.original_func,
+                message=taskiq_msg,
+                ack_controller=ack_controller,
+            )
 
         if ack_time == AcknowledgeType.WHEN_EXECUTED and ack_controller.is_ackable:
             await ack_controller.ack()
@@ -218,7 +226,7 @@ class Receiver:
                 await maybe_awaitable(middleware.post_execute(taskiq_msg, result))
 
         try:
-            if not isinstance(result.error, NoResultError):
+            if not is_stream and not isinstance(result.error, NoResultError):
                 await self.broker.result_backend.set_result(taskiq_msg.task_id, result)
 
                 for middleware in reversed(self.broker.middlewares):
@@ -407,6 +415,205 @@ class Receiver:
                         ),
                     )
 
+        return result
+
+    def _is_stream_task(
+        self,
+        task: Any,
+        message: TaskiqMessage,
+    ) -> bool:
+        """
+        Decide whether the task should be executed as a stream.
+
+        A task is treated as a stream if it is registered as one
+        (``stream_task`` decorator), carries the ``stream`` label,
+        or its target function is an async generator function.
+        """
+        if message.labels.get("stream") or getattr(task, "is_stream_task", False):
+            return True
+        return inspect.isasyncgenfunction(task.original_func)
+
+    async def run_stream_task(
+        self,
+        target: Callable[..., Any],
+        message: TaskiqMessage,
+    ) -> TaskiqResult[Any]:
+        """
+        Execute an async generator task as a stream.
+
+        Every yielded value is appended to the result backend as an
+        ordered fragment. A terminal state is written exactly once, when
+        the generator finishes, raises, or is cancelled. On cancellation
+        the generator is properly closed with ``aclose`` so user-side
+        ``finally`` blocks run; writing the terminal state and
+        cancellation cleanup are shielded from further cancellation.
+
+        :param target: async generator function to execute.
+        :param message: received message.
+        :return: execution metadata (the return value is always None).
+        """
+        found_exception: BaseException | None = None
+        dep_ctx, kwargs = self._prepare_stream_execution(target, message)
+        start_time = time()
+        stream_result = self.broker.result_backend
+        await stream_result.start_stream(message.task_id)
+        state = StreamState.SUCCESS
+        try:
+            if dep_ctx:
+                kwargs = await dep_ctx.resolve_kwargs()
+            kwargs.update(message.kwargs)
+            await self._consume_stream(target, message, kwargs, stream_result)
+        except BaseException as exc:
+            found_exception = exc
+            state = StreamState.FAILURE
+            if isinstance(exc, TimeoutError):
+                logger.warning("Streaming task %s timed out.", message.task_name)
+            else:
+                logger.exception(
+                    "Exception found while executing streaming function.",
+                )
+
+        execution_time = time() - start_time
+        await self._finalize_stream(
+            message=message,
+            state=state,
+            found_exception=found_exception,
+            dep_ctx=dep_ctx,
+        )
+
+        return await self._build_stream_result(
+            message=message,
+            found_exception=found_exception,
+            execution_time=execution_time,
+        )
+
+    def _prepare_stream_execution(
+        self,
+        target: Callable[..., Any],
+        message: TaskiqMessage,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Prepare signature, dependency graph and keyword arguments."""
+        if message.task_name not in self.known_tasks:
+            self._prepare_task(message.task_name, target)
+        if self.validate_params:
+            signature = self.task_signatures.get(message.task_name)
+        else:
+            signature = None
+        parse_params(signature, self.task_hints.get(message.task_name) or {}, message)
+
+        dependency_graph = self.dependency_graphs.get(message.task_name)
+        if dependency_graph is None:
+            return None, {}
+        broker_ctx = self.broker.custom_dependency_context
+        broker_ctx.update(
+            {
+                Context: Context(message, self.broker, None),
+                TaskiqState: self.broker.state,
+            },
+        )
+        dep_ctx = dependency_graph.async_ctx(
+            broker_ctx,
+            self.broker.dependency_overrides or None,
+        )
+        return dep_ctx, {}
+
+    async def _consume_stream(
+        self,
+        target: Callable[..., Any],
+        message: TaskiqMessage,
+        kwargs: dict[str, Any],
+        stream_result: Any,
+    ) -> None:
+        """Create the generator and persist every yielded fragment."""
+        created = target(*message.args, **kwargs)
+        if not inspect.isasyncgen(created):
+            if inspect.isawaitable(created):
+                await created
+            raise TypeError(
+                f"Task {message.task_name} is registered as a streaming task, "
+                "but its target is not an async generator function.",
+            )
+        generator: AsyncGenerator[Any, None] = created  # type: ignore[assignment]
+        seq = 0
+
+        async def _iterate() -> None:
+            nonlocal seq
+            async for value in generator:
+                await stream_result.append_stream_chunk(
+                    message.task_id,
+                    StreamChunk(seq=seq, data=value),
+                )
+                seq += 1
+
+        timeout = message.labels.get("timeout")
+        try:
+            if timeout is not None:
+                with anyio.fail_after(float(timeout)):
+                    await _iterate()
+            else:
+                await _iterate()
+        finally:
+            # Always close the generator so user ``finally`` blocks run,
+            # even on cancellation or timeout.
+            with (
+                anyio.CancelScope(shield=True),
+                contextlib.suppress(BaseException),
+            ):
+                await generator.aclose()
+
+    async def _finalize_stream(
+        self,
+        message: TaskiqMessage,
+        state: StreamState,
+        found_exception: BaseException | None,
+        dep_ctx: Any,
+    ) -> None:
+        """Write terminal state and close the dependency context."""
+        # Both operations are shielded so that cancelling the callback
+        # task (e.g. worker shutdown) still leaves a finished stream.
+        with anyio.CancelScope(shield=True):
+            await self.broker.result_backend.finish_stream(
+                message.task_id,
+                state.value,
+                error=found_exception,
+            )
+
+        if dep_ctx is None:
+            return
+        close_args: tuple[Any, ...] = (None, None, None)
+        if found_exception and self.propagate_exceptions:
+            close_args = (
+                type(found_exception),
+                found_exception,
+                found_exception.__traceback__,
+            )
+        await dep_ctx.close(*close_args)
+
+    async def _build_stream_result(
+        self,
+        message: TaskiqMessage,
+        found_exception: BaseException | None,
+        execution_time: float,
+    ) -> TaskiqResult[Any]:
+        """Assemble the result and run error middlewares."""
+        result: TaskiqResult[Any] = TaskiqResult(
+            is_err=found_exception is not None,
+            log=None,
+            return_value=None,
+            execution_time=round(execution_time, 2),
+            error=found_exception,
+            labels=message.labels,
+        )
+        if found_exception is not None:
+            for middleware in reversed(self.broker.middlewares):
+                if middleware.__class__.on_error != TaskiqMiddleware.on_error:
+                    await maybe_awaitable(
+                        middleware.on_error(
+                            message,
+                            result,
+                            found_exception,
+                        ),
+                    )
         return result
 
     async def listen(self, finish_event: asyncio.Event) -> None:  # pragma: no cover

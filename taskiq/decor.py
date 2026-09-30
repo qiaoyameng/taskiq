@@ -15,6 +15,7 @@ from typing import (
 
 from taskiq.kicker import AsyncKicker
 from taskiq.scheduler.created_schedule import CreatedSchedule
+from taskiq.stream_task import AsyncStreamTaskiqTask
 from taskiq.task import AsyncTaskiqTask
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -135,6 +136,26 @@ class AsyncTaskiqDecoratedTask(Generic[_FuncParams, _ReturnType]):
         :returns: taskiq task.
         """
         return await self.kicker().kiq(*args, **kwargs)
+
+    async def kiq_stream(
+        self,
+        *args: _FuncParams.args,
+        **kwargs: _FuncParams.kwargs,
+    ) -> AsyncStreamTaskiqTask[_ReturnType]:
+        """
+        Kick the task as a streaming task.
+
+        The target function must be an asynchronous generator. Every
+        yielded value is stored as an ordered fragment which can be read
+        from the returned handle.
+
+        :param args: function's arguments.
+        :param kwargs: function's keyword arguments.
+        :return: handle used to read produced fragments.
+        """
+        kicker = self.kicker()
+        kicker.is_stream = True
+        return await kicker.kiq_stream(*args, **kwargs)
 
     async def schedule_by_cron(
         self,

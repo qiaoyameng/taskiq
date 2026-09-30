@@ -77,6 +77,29 @@ class ResultIsReadyError(ResultBackendError):
     __template__ = "Cannot find out if the task is ready"
 
 
+class StreamingNotSupportedError(ResultBackendError):
+    """Error if result backend does not support streaming results."""
+
+    __template__ = "Result backend {backend} does not support streaming results."
+    backend: str
+
+
+class StreamNotFoundError(ResultBackendError):
+    """Error if a stream is unknown to the result backend.
+
+    This error covers two different situations:
+
+    * ``expired=False`` - the stream was never created, so its fragments
+      simply haven't been produced yet.
+    * ``expired=True`` - the stream existed before, but it was removed by
+      the backend's retention policy.
+    """
+
+    __template__ = "Stream for task {task_id} was not found."
+    task_id: str
+    expired: bool = False
+
+
 class SecurityError(TaskiqError):
     """Security related exception."""
 

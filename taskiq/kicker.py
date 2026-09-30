@@ -10,6 +10,7 @@ from typing import (
     ParamSpec,
     TypeVar,
     Union,
+    cast,
     overload,
 )
 
@@ -21,6 +22,7 @@ from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
 from taskiq.scheduler.created_schedule import CreatedSchedule
 from taskiq.scheduler.scheduled_task import CronSpec, ScheduledTask
+from taskiq.stream_task import AsyncStreamTaskiqTask
 from taskiq.task import AsyncTaskiqTask
 from taskiq.utils import maybe_awaitable
 
@@ -51,6 +53,7 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         self.custom_task_id: str | None = None
         self.custom_schedule_id: str | None = None
         self.return_type = return_type
+        self.is_stream = False
 
     def with_labels(
         self,
@@ -159,6 +162,8 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
             kwargs,
         )
         message = self._prepare_message(*args, **kwargs)
+        if self.is_stream:
+            message.labels["stream"] = True
         for middleware in self.broker.middlewares:
             if middleware.__class__.pre_send != TaskiqMiddleware.pre_send:
                 message = await maybe_awaitable(middleware.pre_send(message))
@@ -171,10 +176,47 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
             if middleware.__class__.post_send != TaskiqMiddleware.post_send:
                 await maybe_awaitable(middleware.post_send(message))
 
+        if self.is_stream:
+            return await self._build_stream_task(message)
+
         return AsyncTaskiqTask(
             task_id=message.task_id,
             result_backend=self.broker.result_backend,
             return_type=self.return_type,  # type: ignore # (pyright issue)
+        )
+
+    async def kiq_stream(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncStreamTaskiqTask[Any]:
+        """
+        Kick a streaming task and return its consumer handle.
+
+        :param args: function's arguments.
+        :param kwargs: function's keyword arguments.
+
+        :raises SendTaskError: if we can't send task to the broker.
+
+        :returns: handle used to read ordered stream fragments.
+        """
+        self.is_stream = True
+        return cast(
+            AsyncStreamTaskiqTask[Any],
+            await self.kiq(*args, **kwargs),
+        )
+
+    async def _build_stream_task(
+        self,
+        message: TaskiqMessage,
+    ) -> AsyncStreamTaskiqTask[Any]:
+        # Register the stream before the worker can start producing
+        # fragments. This is idempotent.
+        await self.broker.result_backend.start_stream(message.task_id)
+        return AsyncStreamTaskiqTask(
+            task_id=message.task_id,
+            result_backend=self.broker.result_backend,
+            return_type=self.return_type,
         )
 
     async def schedule_by_cron(
