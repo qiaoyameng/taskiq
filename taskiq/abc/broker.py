@@ -237,6 +237,28 @@ class AsyncBroker(ABC):
         :param message: name of a task.
         """
 
+    async def kick_batch(
+        self,
+        messages: "list[BrokerMessage]",
+    ) -> None:
+        """
+        Kick multiple messages at once.
+
+        THIS IS A PER-MESSAGE FALLBACK IMPLEMENTATION.
+        It simply calls `kick` for every message in order and
+        stops at the first error. It does not provide any atomicity
+        or deduplication guarantees.
+
+        Brokers that support native batch publishing SHOULD override
+        this method. To report partial acceptance, the overridden
+        method may raise `taskiq.exceptions.BatchSendError` with
+        per-item outcomes.
+
+        :param messages: messages to send.
+        """
+        for message in messages:
+            await self.kick(message)
+
     @abstractmethod
     def listen(self) -> AsyncGenerator[bytes | AckableMessage, None]:
         """

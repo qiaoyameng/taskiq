@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from taskiq.error import Error
@@ -51,6 +53,28 @@ class UnknownTaskError(SendTaskError):
 
     __template__ = "Cannot send unknown task to the queue, task name - {task_name}"
     task_name: str
+
+
+class BatchSendError(SendTaskError):
+    """
+    Error used by brokers to report per-item outcomes of a batch send.
+
+    Brokers that implement a native `kick_batch` may raise this error
+    when a batch was only partially accepted:
+
+    * `accepted` - indices of messages the broker has confirmed as accepted.
+    * `rejected` - mapping of message index to a human readable reason for
+      messages the broker has definitively NOT accepted.
+
+    Every index that appears in neither collection is considered UNKNOWN:
+    the message might or might not have been delivered, so it must never
+    be reported as "not sent".
+    """
+
+    __template__ = "Batch send failed: {reason}"
+    reason: str = ""
+    accepted: frozenset[int] = frozenset()
+    rejected: Mapping[int, str] = MappingProxyType({})
 
 
 class ResultBackendError(TaskiqError):

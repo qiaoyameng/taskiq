@@ -43,6 +43,25 @@ async def listen(self) -> AsyncGenerator[AckableMessage, None]:
       )
 ```
 
+## Batch kicks
+
+Clients may send heterogeneous groups of tasks with `taskiq.BatchKicker`,
+which returns a delivery receipt for every message. By default the
+`AsyncBroker.kick_batch` method is a **per-message fallback**: it simply
+calls `kick` for every message in order.
+
+If your broker supports native batch publishing, override `kick_batch`:
+
+```python
+async def kick_batch(self, messages: list[BrokerMessage]) -> None:
+    await self.connection.publish_batch([m.message for m in messages])
+```
+
+To report partial acceptance, raise `taskiq.exceptions.BatchSendError`
+with the indices of `accepted` and `rejected` messages. Every index that
+appears in neither collection is reported to the user as UNKNOWN
+(the message might have been delivered), never as "not sent".
+
 ## Conventions
 
 For brokers, we have several conventions. It's good if your broker implements them.

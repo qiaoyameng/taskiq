@@ -76,6 +76,47 @@ you need to call the `.kiq` method on the function,
 it returns the `TaskiqTask` object that can check whether the result is ready
 or not. Also it has methods to wait for the result to become available.
 
+### Sending batches of tasks
+
+If you want to send a group of heterogeneous tasks at once and get a
+delivery receipt for every message, use `taskiq.BatchKicker`:
+
+```python
+from taskiq import BatchItemStatus, BatchKicker
+
+batch = BatchKicker(broker)
+batch.add(my_task.kicker(), 1, 2)
+batch.add(another_task.kicker(), "hello")
+
+receipts = await batch.kiq()
+for receipt in receipts:
+    print(receipt.task_id, receipt.status)
+```
+
+Receipts are position-aligned with the order of `add` calls. Every message
+is fully serialized and validated before anything is sent. A receipt status
+can be:
+
+* `BatchItemStatus.ACCEPTED` - the broker confirmed the delivery;
+* `BatchItemStatus.REJECTED` - the message was definitively NOT sent
+  (e.g. it failed serialization) and is safe to retry;
+* `BatchItemStatus.UNKNOWN` - the send attempt was interrupted (e.g. the
+  connection was lost), so the broker might have received the message.
+  It is never reported as "not sent".
+
+You can resend selected items with their original task_ids:
+
+```python
+await batch.retry([i for i, r in enumerate(receipts) if not r.ok])
+```
+
+::: warning Retries and deduplication
+
+Retrying an UNKNOWN item may produce duplicates. Taskiq does NOT guarantee
+deduplication of redelivered task_ids - it depends on the broker you use.
+
+:::
+
 You can get more information about taskiq types, CLI and internal structure in the "[Architecture overview](./architecture-overview.md)" section.
 
 ## Distributed run
